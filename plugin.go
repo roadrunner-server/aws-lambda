@@ -149,10 +149,6 @@ func (p *Plugin) handler() func(ctx context.Context, request events.APIGatewayV2
 			return events.APIGatewayV2HTTPResponse{Body: "worker empty response", StatusCode: 500}, nil
 		}
 
-		if err != nil {
-			return events.APIGatewayV2HTTPResponse{Body: "", StatusCode: 500}, nil
-		}
-
 		var response events.APIGatewayV2HTTPResponse
 		err = json.Unmarshal(r.Body, &response)
 		if err != nil {
