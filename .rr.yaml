@@ -1,0 +1,15 @@
+version: "3"
+
+server:
+  command: "php public/index.php"
+  relay: pipes
+  relay_timeout: 60s
+
+logs:
+  mode: production
+  level: error
+  encoding: json
+  output: stderr
+
+endure:
+  grace_period: 1s
