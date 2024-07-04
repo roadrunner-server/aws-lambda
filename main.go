@@ -28,7 +28,6 @@ func main() {
 	cfg := &config.Plugin{
 		Version:   "2023.3.0",
 		Timeout:   time.Second * 30,
-		Prefix:    "rr",
 		Type:      "yaml",
 		ReadInCfg: rrYaml,
 	}
