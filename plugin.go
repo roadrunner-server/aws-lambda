@@ -8,13 +8,13 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/roadrunner-server/errors"
 	"github.com/roadrunner-server/goridge/v3/pkg/frame"
-	"github.com/roadrunner-server/sdk/v4/pool"
-	"github.com/roadrunner-server/sdk/v4/worker"
+	"github.com/roadrunner-server/pool/pool"
+	"github.com/roadrunner-server/pool/worker"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/roadrunner-server/sdk/v4/payload"
-	poolImp "github.com/roadrunner-server/sdk/v4/pool/static_pool"
+	"github.com/roadrunner-server/pool/payload"
+	poolImp "github.com/roadrunner-server/pool/pool/static_pool"
 	"go.uber.org/zap"
 )
 

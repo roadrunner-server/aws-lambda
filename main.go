@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/roadrunner-server/config/v4"
+	"github.com/roadrunner-server/config/v5"
 	"github.com/roadrunner-server/endure/v2"
-	"github.com/roadrunner-server/logger/v4"
-	"github.com/roadrunner-server/server/v4"
+	"github.com/roadrunner-server/logger/v5"
+	"github.com/roadrunner-server/server/v5"
 )
 
 //go:embed .rr.yaml
