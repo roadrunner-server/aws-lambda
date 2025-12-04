@@ -2,14 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"sync"
 	"time"
 
-	"github.com/goccy/go-json"
+	httpV1proto "github.com/roadrunner-server/api/v4/build/http/v1"
 	"github.com/roadrunner-server/errors"
 	"github.com/roadrunner-server/goridge/v3/pkg/frame"
 	"github.com/roadrunner-server/pool/pool"
 	"github.com/roadrunner-server/pool/worker"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -23,11 +26,12 @@ const (
 )
 
 type Plugin struct {
-	mu      sync.Mutex
-	log     *zap.Logger
-	srv     Server
-	pldPool sync.Pool
-	wrkPool Pool
+	mu           sync.Mutex
+	log          *zap.Logger
+	srv          Server
+	pldPool      sync.Pool
+	wrkPool      Pool
+	protoReqPool sync.Pool
 }
 
 // Logger plugin
@@ -65,6 +69,12 @@ func (p *Plugin) Init(srv Server, log Logger) error {
 				Context: make([]byte, 0, 100),
 				Body:    make([]byte, 0, 100),
 			}
+		},
+	}
+
+	p.protoReqPool = sync.Pool{
+		New: func() any {
+			return &httpV1proto.Request{}
 		},
 	}
 
@@ -110,21 +120,18 @@ func (p *Plugin) Stop(ctx context.Context) error {
 
 func (p *Plugin) handler() func(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
 	return func(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
-		requestJSON, err := json.Marshal(request)
-		if err != nil {
-			return events.APIGatewayV2HTTPResponse{Body: "", StatusCode: 500}, nil
-		}
-
-		ctxJSON, err := json.Marshal(ctx)
-		if err != nil {
-			return events.APIGatewayV2HTTPResponse{Body: "", StatusCode: 500}, nil
-		}
+		reqProto := p.getProtoReq(request)
+		defer p.putProtoReq(reqProto)
 
 		pld := p.getPld()
 		defer p.putPld(pld)
+		rp, err := proto.Marshal(reqProto)
+		if err != nil {
+			return events.APIGatewayV2HTTPResponse{Body: err.Error(), StatusCode: 500}, nil
+		}
 
-		pld.Body = requestJSON
-		pld.Context = ctxJSON
+		pld.Body = []byte(request.Body)
+		pld.Context = rp
 
 		re, err := p.wrkPool.Exec(ctx, pld, nil)
 		if err != nil {
@@ -166,5 +173,79 @@ func (p *Plugin) putPld(pld *payload.Payload) {
 
 func (p *Plugin) getPld() *payload.Payload {
 	pld := p.pldPool.Get().(*payload.Payload)
+	pld.Codec = frame.CodecProto
 	return pld
+}
+
+func (p *Plugin) getProtoReq(r events.APIGatewayV2HTTPRequest) *httpV1proto.Request {
+	req := p.protoReqPool.Get().(*httpV1proto.Request)
+
+	req.RemoteAddr = r.RequestContext.HTTP.SourceIP
+	req.Protocol = r.RequestContext.HTTP.Protocol
+	req.Method = r.RequestContext.HTTP.Method
+	req.Uri = r.RawPath
+	req.Header = convert(r.Headers)
+	req.Cookies = convertCookies(r.Cookies, p.log)
+	req.RawQuery = r.RawQueryString
+	req.Parsed = true
+	req.Attributes = make(map[string]*httpV1proto.HeaderValue)
+
+	return req
+}
+
+func (p *Plugin) putProtoReq(req *httpV1proto.Request) {
+	req.RemoteAddr = ""
+	req.Protocol = ""
+	req.Method = ""
+	req.Uri = ""
+	req.Header = nil
+	req.Cookies = nil
+	req.RawQuery = ""
+	req.Parsed = false
+	req.Uploads = nil
+	req.Attributes = nil
+
+	p.protoReqPool.Put(req)
+}
+
+func convertCookies(cookies []string, log *zap.Logger) map[string]*httpV1proto.HeaderValue {
+	if len(cookies) == 0 {
+		return nil
+	}
+
+	resp := make(map[string]*httpV1proto.HeaderValue, len(cookies))
+
+	for _, h := range cookies {
+		ck, err := http.ParseCookie(h)
+		if err != nil {
+			log.Error("failed to parse cookie", zap.Error(err))
+			continue
+		}
+
+		for _, v := range ck {
+			resp[v.Name] = &httpV1proto.HeaderValue{
+				Value: [][]byte{[]byte(v.Value)},
+			}
+		}
+	}
+
+	return resp
+}
+
+func convert(headers map[string]string) map[string]*httpV1proto.HeaderValue {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	resp := make(map[string]*httpV1proto.HeaderValue, len(headers))
+
+	for k, v := range headers {
+		if resp[k] == nil {
+			resp[k] = &httpV1proto.HeaderValue{}
+		}
+
+		resp[k].Value = append(resp[k].Value, []byte(v))
+	}
+
+	return resp
 }
