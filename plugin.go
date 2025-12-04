@@ -272,6 +272,7 @@ func convert(headers map[string]string) map[string]*httpV1proto.HeaderValue {
 func (p *Plugin) handlePROTOresponse(pld *payload.Payload, response *events.APIGatewayV2HTTPResponse) error {
 	rsp := p.getProtoRsp()
 	defer p.putProtoRsp(rsp)
+	response.Headers = make(map[string]string)
 
 	if len(pld.Context) != 0 {
 		// unmarshal context into response
