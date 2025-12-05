@@ -162,9 +162,6 @@ func (p *Plugin) handler() func(ctx context.Context, request events.APIGatewayV2
 		}
 
 		var response events.APIGatewayV2HTTPResponse
-		rsp := p.getProtoRsp()
-		defer p.putProtoRsp(rsp)
-
 		err = p.handlePROTOresponse(r, &response)
 		if err != nil {
 			return events.APIGatewayV2HTTPResponse{Body: err.Error(), StatusCode: 500}, nil
@@ -206,7 +203,7 @@ func (p *Plugin) getProtoReq(r events.APIGatewayV2HTTPRequest) *httpV1proto.Requ
 	req.Header = convert(r.Headers)
 	req.Cookies = convertCookies(r.Cookies, p.log)
 	req.RawQuery = r.RawQueryString
-	req.Parsed = true
+	req.Parsed = false
 	req.Attributes = make(map[string]*httpV1proto.HeaderValue)
 
 	return req
