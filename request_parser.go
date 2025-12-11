@@ -117,8 +117,8 @@ func contentType(method, ct string) int {
 	}
 }
 
-func parseURLEncoded(ctx context.Context, body []byte, headers map[string]string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/", bytes.NewReader(body))
+func parseURLEncoded(body []byte, headers map[string]string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -139,8 +139,8 @@ func parseURLEncoded(ctx context.Context, body []byte, headers map[string]string
 	return packDataTree(data)
 }
 
-func parseMultipart(ctx context.Context, body []byte, headers map[string]string) ([]byte, *Uploads, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/", bytes.NewReader(body))
+func parseMultipart(body []byte, headers map[string]string) ([]byte, *Uploads, error) {
+	req, err := http.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, err
 	}
