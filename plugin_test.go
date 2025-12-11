@@ -360,7 +360,7 @@ func TestHandlerBuildsLambdaRequests(t *testing.T) {
 			}
 
 			if len(tt.cookies) > 0 {
-				if gotReq.Cookies == nil || len(gotReq.Cookies) == 0 {
+				if len(gotReq.Cookies) == 0 {
 					t.Fatalf("expected cookies to be parsed")
 				}
 			}

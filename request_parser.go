@@ -117,8 +117,8 @@ func contentType(method, ct string) int {
 	}
 }
 
-func parseURLEncoded(body []byte, headers map[string]string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+func parseURLEncoded(ctx context.Context, body []byte, headers map[string]string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -139,8 +139,8 @@ func parseURLEncoded(body []byte, headers map[string]string) ([]byte, error) {
 	return packDataTree(data)
 }
 
-func parseMultipart(body []byte, headers map[string]string) ([]byte, *Uploads, error) {
-	req, err := http.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+func parseMultipart(ctx context.Context, body []byte, headers map[string]string) ([]byte, *Uploads, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "/", bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -319,7 +319,11 @@ func (ft fileTree) mount(i []string, v []*FileUpload) error {
 		return nil
 	}
 
-	return ft[i[0]].(fileTree).mount(i[1:], v)
+	sub, ok := ft[i[0]].(fileTree)
+	if !ok {
+		return errors.New("invalid tree structure: expected fileTree")
+	}
+	return sub.mount(i[1:], v)
 }
 
 func fetchIndexes(s string, keys *[]string) {

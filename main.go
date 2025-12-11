@@ -82,14 +82,4 @@ func main() {
 func configureEnvironment() {
 	_ = os.Setenv("PATH", os.Getenv("PATH")+":"+os.Getenv("LAMBDA_TASK_ROOT"))
 	_ = os.Setenv("LD_LIBRARY_PATH", "./lib:/lib64:/usr/lib64")
-
-	for _, dir := range []string{
-		"/tmp/symfony/cache",
-		"/tmp/symfony/logs",
-		"/tmp/symfony/shared",
-	} {
-		if err := os.MkdirAll(dir, 0o777); err != nil {
-			log.Printf("failed to create %s: %v", dir, err)
-		}
-	}
 }
