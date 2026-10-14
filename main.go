@@ -20,8 +20,7 @@ import (
 var rrYaml []byte
 
 func main() {
-	_ = os.Setenv("PATH", os.Getenv("PATH")+":"+os.Getenv("LAMBDA_TASK_ROOT"))
-	_ = os.Setenv("LD_LIBRARY_PATH", "./lib:/lib64:/usr/lib64")
+	configureEnvironment()
 
 	cont := endure.New(slog.LevelError)
 
@@ -78,4 +77,9 @@ func main() {
 	}()
 
 	wg.Wait()
+}
+
+func configureEnvironment() {
+	_ = os.Setenv("PATH", os.Getenv("PATH")+":"+os.Getenv("LAMBDA_TASK_ROOT"))
+	_ = os.Setenv("LD_LIBRARY_PATH", "./lib:/lib64:/usr/lib64")
 }

@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -130,12 +134,34 @@ func (p *Plugin) handler() func(ctx context.Context, request events.APIGatewayV2
 
 		pld := p.getPld()
 		defer p.putPld(pld)
+		cleanup := func() {}
+		body := []byte(request.Body)
+		if request.IsBase64Encoded {
+			decoded, err := base64.StdEncoding.DecodeString(request.Body)
+			if err != nil {
+				return events.APIGatewayV2HTTPResponse{Body: err.Error(), StatusCode: 400}, nil
+			}
+			body = decoded
+		}
+
+		transformedBody, uploads, parsed, uploadsCleanup, err := p.transformBody(request, body)
+		if err != nil {
+			return events.APIGatewayV2HTTPResponse{Body: err.Error(), StatusCode: 400}, nil
+		}
+		if uploadsCleanup != nil {
+			cleanup = uploadsCleanup
+		}
+		defer cleanup()
+
+		reqProto.Parsed = parsed
+		reqProto.Uploads = uploads
+
 		rp, err := proto.Marshal(reqProto)
 		if err != nil {
 			return events.APIGatewayV2HTTPResponse{Body: err.Error(), StatusCode: 500}, nil
 		}
 
-		pld.Body = []byte(request.Body)
+		pld.Body = transformedBody
 		pld.Context = rp
 
 		re, err := p.wrkPool.Exec(ctx, pld, nil)
@@ -195,12 +221,13 @@ func (p *Plugin) getProtoRsp() *httpV1proto.Response {
 
 func (p *Plugin) getProtoReq(r events.APIGatewayV2HTTPRequest) *httpV1proto.Request {
 	req := p.protoReqPool.Get().(*httpV1proto.Request)
+	headers := normalizeHeaders(r)
 
 	req.RemoteAddr = r.RequestContext.HTTP.SourceIP
 	req.Protocol = r.RequestContext.HTTP.Protocol
 	req.Method = r.RequestContext.HTTP.Method
-	req.Uri = r.RawPath
-	req.Header = convert(r.Headers)
+	req.Uri = buildURI(r.RawPath, r.RawQueryString)
+	req.Header = convert(headers)
 	req.Cookies = convertCookies(r.Cookies, p.log)
 	req.RawQuery = r.RawQueryString
 	req.Parsed = false
@@ -239,8 +266,9 @@ func convertCookies(cookies []string, log *zap.Logger) map[string]*httpV1proto.H
 		}
 
 		for _, v := range ck {
+			decoded, _ := url.QueryUnescape(v.Value)
 			resp[v.Name] = &httpV1proto.HeaderValue{
-				Value: [][]byte{[]byte(v.Value)},
+				Value: [][]byte{[]byte(decoded)},
 			}
 		}
 	}
@@ -264,6 +292,83 @@ func convert(headers map[string]string) map[string]*httpV1proto.HeaderValue {
 	}
 
 	return resp
+}
+
+// normalizeHeaders guarantees that reverse-proxy headers exist and are
+// consistent so Symfony can correctly detect the client and scheme when
+// running behind CloudFront and API Gateway.
+func normalizeHeaders(r events.APIGatewayV2HTTPRequest) map[string]string {
+	headers := make(map[string]string, len(r.Headers)+6)
+	for k, v := range r.Headers {
+		if k == "" {
+			continue
+		}
+		headers[strings.ToLower(k)] = v
+	}
+
+	sourceIP := strings.TrimSpace(r.RequestContext.HTTP.SourceIP)
+	if sourceIP != "" {
+		if existing, ok := headers["x-forwarded-for"]; ok && existing != "" {
+			if !strings.Contains(existing, sourceIP) {
+				headers["x-forwarded-for"] = existing + ", " + sourceIP
+			}
+		} else {
+			headers["x-forwarded-for"] = sourceIP
+		}
+	}
+
+	proto := headers["x-forwarded-proto"]
+	if proto == "" {
+		switch {
+		case headers["cloudfront-forwarded-proto"] != "":
+			proto = headers["cloudfront-forwarded-proto"]
+		case headers["x-amzn-scheme"] != "":
+			proto = headers["x-amzn-scheme"]
+		case strings.HasPrefix(strings.ToLower(r.RequestContext.DomainName), "localhost"):
+			proto = "http"
+		default:
+			proto = "https"
+		}
+		headers["x-forwarded-proto"] = proto
+	}
+
+	host := headers["x-forwarded-host"]
+	if host == "" {
+		// Prioritize the actual Host header from CloudFront over API Gateway domain
+		switch {
+		case headers["host"] != "":
+			host = headers["host"]
+		case r.RequestContext.DomainName != "":
+			host = r.RequestContext.DomainName
+		}
+		if host != "" {
+			headers["x-forwarded-host"] = host
+		}
+	}
+
+	if _, ok := headers["x-forwarded-port"]; !ok || headers["x-forwarded-port"] == "" {
+		if strings.EqualFold(proto, "https") {
+			headers["x-forwarded-port"] = "443"
+		} else {
+			headers["x-forwarded-port"] = "80"
+		}
+	}
+
+	if _, ok := headers["x-forwarded-prefix"]; !ok {
+		stage := strings.TrimSpace(r.RequestContext.Stage)
+		if stage != "" && stage != "$default" && stage != "default" {
+			if !strings.HasPrefix(stage, "/") {
+				stage = "/" + stage
+			}
+			headers["x-forwarded-prefix"] = stage
+		}
+	}
+
+	if _, ok := headers["forwarded"]; !ok && sourceIP != "" && host != "" {
+		headers["forwarded"] = "for=" + sourceIP + ";proto=" + proto + ";host=" + host
+	}
+
+	return headers
 }
 
 func (p *Plugin) handlePROTOresponse(pld *payload.Payload, response *events.APIGatewayV2HTTPResponse) error {
@@ -296,4 +401,51 @@ func (p *Plugin) handlePROTOresponse(pld *payload.Payload, response *events.APIG
 	response.Body = string(pld.Body)
 
 	return nil
+}
+
+func (p *Plugin) transformBody(request events.APIGatewayV2HTTPRequest, body []byte) ([]byte, []byte, bool, func(), error) {
+	ct := strings.ToLower(request.Headers["content-type"])
+	switch contentType(request.RequestContext.HTTP.Method, ct) {
+	case contentNone:
+		return nil, nil, false, nil, nil
+	case contentURLEncoded:
+		b, err := parseURLEncoded(body, request.Headers)
+		if err != nil {
+			return nil, nil, false, nil, err
+		}
+		return b, nil, true, nil, nil
+	case contentMultipart:
+		b, uploads, err := parseMultipart(body, request.Headers)
+		if err != nil {
+			return nil, nil, false, nil, err
+		}
+
+		var uploadsBytes []byte
+		if uploads != nil {
+			uploadsBytes, err = json.Marshal(uploads)
+			if err != nil {
+				return nil, nil, false, nil, err
+			}
+		}
+
+		cleanup := func() {
+			if uploads != nil {
+				uploads.Clear()
+			}
+		}
+
+		return b, uploadsBytes, true, cleanup, nil
+	default:
+		return body, nil, false, nil, nil
+	}
+}
+
+func buildURI(path, rawQuery string) string {
+	if path == "" {
+		path = "/"
+	}
+	if rawQuery == "" {
+		return path
+	}
+	return path + "?" + rawQuery
 }

@@ -3,10 +3,15 @@ version: "3"
 server:
   command: "php public/index.php"
   relay: pipes
+  env:
+    APP_ENV: prod
+    APP_RUNTIME: Runtime\RoadRunnerSymfonyNyholm\Runtime
+    SYMFONY_CACHE_DIR: /tmp/symfony-cache
+    SYMFONY_LOG_DIR: /tmp/symfony-logs
 
 logs:
-  mode: production
-  level: error
+  mode: development
+  level: debug
   encoding: json
   output: stderr
 
