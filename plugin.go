@@ -1,299 +1,170 @@
-package main
+// Package awslambda runs RoadRunner inside an AWS Lambda custom runtime: it
+// serves the Lambda Runtime API and hands every invocation to the plugins that
+// implement Invokable.
+package awslambda
 
 import (
 	"context"
-	"net/http"
-	"sync"
+	"log/slog"
+	"os"
 	"time"
 
-	httpV1proto "github.com/roadrunner-server/api/v4/build/http/v1"
-	"github.com/roadrunner-server/errors"
-	"github.com/roadrunner-server/goridge/v3/pkg/frame"
-	"github.com/roadrunner-server/pool/pool"
-	"github.com/roadrunner-server/pool/worker"
-	"google.golang.org/protobuf/proto"
-
-	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/roadrunner-server/pool/payload"
-	poolImp "github.com/roadrunner-server/pool/pool/static_pool"
-	"go.uber.org/zap"
+	"github.com/roadrunner-server/endure/v2/dep"
+	"github.com/roadrunner-server/errors"
 )
 
 const (
-	pluginName string = "lambda"
+	pluginName     = "lambda"
+	runtimeAPIEnv  = "AWS_LAMBDA_RUNTIME_API"
+	minimumRunTime = time.Second
 )
 
-type Plugin struct {
-	mu            sync.Mutex
-	log           *zap.Logger
-	srv           Server
-	pldPool       sync.Pool
-	wrkPool       Pool
-	protoReqPool  sync.Pool
-	protoRespPool sync.Pool
+// Invokable is implemented by plugins that do their work per Lambda invocation
+// instead of running forever. The plugin is never imported by them: endure
+// matches the methods, the same way the resetter plugin collects Resetter.
+type Invokable interface {
+	// StartInvocation begins the work for one invocation, within the graceful
+	// budget the handler will be given to drain.
+	StartInvocation(ctx context.Context, graceful time.Duration) error
+	// StopInvocation drains it before the deadline.
+	StopInvocation(ctx context.Context) error
+	Name() string
 }
 
-// Logger plugin
+type Configurer interface {
+	UnmarshalKey(name string, out any) error
+	Has(name string) bool
+}
+
 type Logger interface {
-	NamedLogger(name string) *zap.Logger
+	NamedLogger(name string) *slog.Logger
 }
 
-type Pool interface {
-	// Workers returns workers list associated with the pool.
-	Workers() (workers []*worker.Process)
-	// Exec payload
-	Exec(ctx context.Context, p *payload.Payload, stopCh chan struct{}) (chan *poolImp.PExec, error)
-	// RemoveWorker removes worker from the pool.
-	RemoveWorker(ctx context.Context) error
-	// AddWorker adds worker to the pool.
-	AddWorker() error
-	// Reset kill all workers inside the watcher and replaces with new
-	Reset(ctx context.Context) error
-	// Destroy all underlying stacks (but let them complete the task).
-	Destroy(ctx context.Context)
+type Plugin struct {
+	log      *slog.Logger
+	cfg      *Config
+	registry map[string]Invokable
 }
 
-// Server creates workers for the application.
-type Server interface {
-	NewPool(ctx context.Context, cfg *pool.Config, env map[string]string, _ *zap.Logger) (*poolImp.Pool, error)
-}
+func (p *Plugin) Init(cfg Configurer, log Logger) error {
+	const op = errors.Op("lambda_plugin_init")
 
-func (p *Plugin) Init(srv Server, log Logger) error {
-	p.srv = srv
+	if os.Getenv(runtimeAPIEnv) == "" {
+		return errors.E(errors.Disabled)
+	}
+
+	p.cfg = &Config{}
+	if cfg.Has(pluginName) {
+		if err := cfg.UnmarshalKey(pluginName, p.cfg); err != nil {
+			return errors.E(op, err)
+		}
+	}
+
+	if err := p.cfg.InitDefaults(); err != nil {
+		return errors.E(op, err)
+	}
+
 	p.log = log.NamedLogger(pluginName)
-	p.pldPool = sync.Pool{
-		New: func() any {
-			return &payload.Payload{
-				Codec:   frame.CodecJSON,
-				Context: make([]byte, 0, 100),
-				Body:    make([]byte, 0, 100),
-			}
-		},
-	}
-
-	p.protoReqPool = sync.Pool{
-		New: func() any {
-			return &httpV1proto.Request{}
-		},
-	}
-	p.protoRespPool = sync.Pool{
-		New: func() any {
-			return &httpV1proto.Response{}
-		},
-	}
+	p.registry = make(map[string]Invokable)
 
 	return nil
 }
 
+func (p *Plugin) Collects() []*dep.In {
+	return []*dep.In{
+		dep.Fits(func(pl any) {
+			invokable := pl.(Invokable)
+			p.registry[invokable.Name()] = invokable
+		}, (*Invokable)(nil)),
+	}
+}
+
 func (p *Plugin) Serve() chan error {
 	errCh := make(chan error, 1)
-	const op = errors.Op("plugin_serve")
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	var err error
-	p.wrkPool, err = p.srv.NewPool(context.Background(), &pool.Config{
-		NumWorkers:      4,
-		AllocateTimeout: time.Second * 20,
-		DestroyTimeout:  time.Second * 20,
-	}, nil, nil)
-	if err != nil {
-		errCh <- errors.E(op, err)
-		return errCh
-	}
+	p.log.Info("serving the lambda runtime api",
+		"shutdown_buffer", p.cfg.ShutdownBuffer.String(),
+		"graceful_timeout", p.cfg.GracefulTimeout.String(),
+		"handlers", len(p.registry),
+	)
 
 	go func() {
-		// register handler
-		lambda.Start(p.handler())
+		lambda.Start(p.handle)
 	}()
 
 	return errCh
 }
 
-func (p *Plugin) Stop(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (p *Plugin) Stop(context.Context) error {
+	return nil
+}
 
-	if p.wrkPool != nil {
-		p.wrkPool.Destroy(ctx)
+func (p *Plugin) Name() string {
+	return pluginName
+}
+
+func (p *Plugin) handle(ctx context.Context) error {
+	const op = errors.Op("lambda_invocation")
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return errors.E(op, errors.Str("the Runtime API did not provide an invocation deadline"))
 	}
+
+	stopAt := deadline.Add(-p.cfg.ShutdownBuffer)
+
+	runFor := time.Until(stopAt)
+	if runFor < minimumRunTime {
+		return errors.E(op, errors.Errorf(
+			"insufficient invocation time: %s left after reserving a %s shutdown buffer",
+			runFor, p.cfg.ShutdownBuffer,
+		))
+	}
+
+	started := p.startAll(ctx)
+	p.log.Info("invocation started", "polling_for", runFor.String(), "handlers", len(started))
+
+	p.waitUntil(ctx, stopAt)
+	p.stopAll(started)
+
+	p.log.Info("invocation finished", "remaining", time.Until(deadline).String())
 
 	return nil
 }
 
-func (p *Plugin) handler() func(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
-	return func(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
-		reqProto := p.getProtoReq(request)
-		defer p.putProtoReq(reqProto)
+func (p *Plugin) startAll(ctx context.Context) []Invokable {
+	started := make([]Invokable, 0, len(p.registry))
 
-		pld := p.getPld()
-		defer p.putPld(pld)
-		rp, err := proto.Marshal(reqProto)
-		if err != nil {
-			return events.APIGatewayV2HTTPResponse{Body: err.Error(), StatusCode: 500}, nil
-		}
-
-		pld.Body = []byte(request.Body)
-		pld.Context = rp
-
-		re, err := p.wrkPool.Exec(ctx, pld, nil)
-		if err != nil {
-			return events.APIGatewayV2HTTPResponse{Body: err.Error(), StatusCode: 500}, nil
-		}
-
-		var r *payload.Payload
-
-		select {
-		case pl := <-re:
-			if pl.Error() != nil {
-				return events.APIGatewayV2HTTPResponse{Body: pl.Error().Error(), StatusCode: 500}, nil
-			}
-			// streaming is not supported
-			if pl.Payload().Flags&frame.STREAM != 0 {
-				return events.APIGatewayV2HTTPResponse{Body: "streaming is not supported", StatusCode: 500}, nil
-			}
-
-			// assign the payload
-			r = pl.Payload()
-		default:
-			return events.APIGatewayV2HTTPResponse{Body: "worker empty response", StatusCode: 500}, nil
-		}
-
-		var response events.APIGatewayV2HTTPResponse
-		err = p.handlePROTOresponse(r, &response)
-		if err != nil {
-			return events.APIGatewayV2HTTPResponse{Body: err.Error(), StatusCode: 500}, nil
-		}
-
-		return response, nil
-	}
-}
-
-func (p *Plugin) putPld(pld *payload.Payload) {
-	pld.Body = nil
-	pld.Context = nil
-	p.pldPool.Put(pld)
-}
-
-func (p *Plugin) getPld() *payload.Payload {
-	pld := p.pldPool.Get().(*payload.Payload)
-	pld.Codec = frame.CodecProto
-	return pld
-}
-
-func (p *Plugin) putProtoRsp(rsp *httpV1proto.Response) {
-	rsp.Headers = nil
-	rsp.Status = -1
-	p.protoRespPool.Put(rsp)
-}
-
-func (p *Plugin) getProtoRsp() *httpV1proto.Response {
-	return p.protoRespPool.Get().(*httpV1proto.Response)
-}
-
-func (p *Plugin) getProtoReq(r events.APIGatewayV2HTTPRequest) *httpV1proto.Request {
-	req := p.protoReqPool.Get().(*httpV1proto.Request)
-
-	req.RemoteAddr = r.RequestContext.HTTP.SourceIP
-	req.Protocol = r.RequestContext.HTTP.Protocol
-	req.Method = r.RequestContext.HTTP.Method
-	req.Uri = r.RawPath
-	req.Header = convert(r.Headers)
-	req.Cookies = convertCookies(r.Cookies, p.log)
-	req.RawQuery = r.RawQueryString
-	req.Parsed = false
-	req.Attributes = make(map[string]*httpV1proto.HeaderValue)
-
-	return req
-}
-
-func (p *Plugin) putProtoReq(req *httpV1proto.Request) {
-	req.RemoteAddr = ""
-	req.Protocol = ""
-	req.Method = ""
-	req.Uri = ""
-	req.Header = nil
-	req.Cookies = nil
-	req.RawQuery = ""
-	req.Parsed = false
-	req.Uploads = nil
-	req.Attributes = nil
-
-	p.protoReqPool.Put(req)
-}
-
-func convertCookies(cookies []string, log *zap.Logger) map[string]*httpV1proto.HeaderValue {
-	if len(cookies) == 0 {
-		return nil
-	}
-
-	resp := make(map[string]*httpV1proto.HeaderValue, len(cookies))
-
-	for _, h := range cookies {
-		ck, err := http.ParseCookie(h)
-		if err != nil {
-			log.Error("failed to parse cookie", zap.Error(err))
+	for name, invokable := range p.registry {
+		if err := invokable.StartInvocation(ctx, p.cfg.GracefulTimeout); err != nil {
+			p.log.Error("handler failed to start", "handler", name, "error", err)
 			continue
 		}
 
-		for _, v := range ck {
-			resp[v.Name] = &httpV1proto.HeaderValue{
-				Value: [][]byte{[]byte(v.Value)},
-			}
-		}
+		started = append(started, invokable)
 	}
 
-	return resp
+	return started
 }
 
-func convert(headers map[string]string) map[string]*httpV1proto.HeaderValue {
-	if len(headers) == 0 {
-		return nil
-	}
+func (p *Plugin) stopAll(started []Invokable) {
+	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.GracefulTimeout)
+	defer cancel()
 
-	resp := make(map[string]*httpV1proto.HeaderValue, len(headers))
-
-	for k, v := range headers {
-		if resp[k] == nil {
-			resp[k] = &httpV1proto.HeaderValue{}
+	for i := range started {
+		if err := started[i].StopInvocation(ctx); err != nil {
+			p.log.Error("handler failed to stop", "handler", started[i].Name(), "error", err)
 		}
-
-		resp[k].Value = append(resp[k].Value, []byte(v))
 	}
-
-	return resp
 }
 
-func (p *Plugin) handlePROTOresponse(pld *payload.Payload, response *events.APIGatewayV2HTTPResponse) error {
-	rsp := p.getProtoRsp()
-	defer p.putProtoRsp(rsp)
-	response.Headers = make(map[string]string)
+func (p *Plugin) waitUntil(ctx context.Context, stopAt time.Time) {
+	timer := time.NewTimer(time.Until(stopAt))
+	defer timer.Stop()
 
-	if len(pld.Context) != 0 {
-		// unmarshal context into response
-		err := proto.Unmarshal(pld.Context, rsp)
-		if err != nil {
-			return err
-		}
-
-		// write all headers from the response to the writer
-		for k := range rsp.GetHeaders() {
-			for kk := range rsp.GetHeaders()[k].GetValue() {
-				response.Headers[k] = string(rsp.GetHeaders()[k].GetValue()[kk])
-			}
-		}
-
-		response.StatusCode = int(rsp.Status)
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
 	}
-
-	// do not write body if it is empty
-	if len(pld.Body) == 0 {
-		return nil
-	}
-
-	response.Body = string(pld.Body)
-
-	return nil
 }
